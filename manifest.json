@@ -1,0 +1,42 @@
+{
+  "manifest_version": 2,
+  "name": "X Feed Filter — Gemini AI",
+  "version": "1.0.0",
+  "description": "Filter your X (Twitter) feed using Google Gemini AI based on custom keywords.",
+  "author": "You",
+
+  "permissions": [
+    "storage",
+    "activeTab",
+    "*://x.com/*",
+    "*://twitter.com/*",
+    "https://generativelanguage.googleapis.com/*"
+  ],
+
+  "browser_action": {
+    "default_popup": "popup.html",
+    "default_title": "X Feed Filter",
+    "default_icon": {
+      "48": "icons/icon48.png",
+      "96": "icons/icon96.png"
+    }
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["*://x.com/*", "*://twitter.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": false
+  },
+
+  "icons": {
+    "48": "icons/icon48.png",
+    "96": "icons/icon96.png"
+  }
+}
