@@ -11,9 +11,11 @@
   let settings = {
     enabled:     false,
     apiKey:      '',
-    keywords:    [],
+    kwWhite:     [],   // keep-keywords  → fed to AI as topics
+    kwBlack:     [],   // block-keywords → always hide, no AI
+    usersWl:     [],   // user whitelist → always show
     filterMode:  'semantic',
-    provider:    'gemini',      // 'gemini' | 'openai'
+    provider:    'gemini',
     openaiModel: 'gpt-4o-mini',
   };
 
@@ -29,7 +31,7 @@
 
   // Batch config
   const BATCH_SIZE     = 10;    // send when we have this many new tweets
-  const BATCH_DELAY    = 10000;  // or after 5s, whichever comes first
+  const BATCH_DELAY    = 5000;  // or after 5s, whichever comes first
   const RETRY_DELAY    = 62000; // 62s back-off after 429
 
   let batchTimer       = null;
@@ -37,9 +39,9 @@
   let lastCallAt        = 0;     // timestamp of last API call
 
   // ── Init ───────────────────────────────────────────────────────────────────
-  browser.storage.local.get(['apiKey', 'keywords', 'enabled', 'filterMode', 'provider', 'openaiModel']).then(data => {
+  browser.storage.local.get(['apiKey', 'kwWhite', 'kwBlack', 'usersWl', 'enabled', 'filterMode', 'provider', 'openaiModel']).then(data => {
     Object.assign(settings, data);
-    if (settings.enabled && settings.keywords.length > 0) {
+    if (settings.enabled && hasAnyList()) {
       observeFeed();
       scanExistingTweets();
     }
@@ -53,7 +55,7 @@
     clearTimeout(batchTimer);
     batchTimer = null;
 
-    if (settings.enabled && settings.keywords.length > 0) {
+    if (settings.enabled && hasAnyList()) {
       observeFeed();
       scanExistingTweets();
     } else {
@@ -61,6 +63,12 @@
       stopObserving();
     }
   });
+
+  function hasAnyList() {
+    return (settings.kwWhite || []).length > 0 ||
+           (settings.kwBlack || []).length > 0 ||
+           (settings.usersWl || []).length > 0;
+  }
 
   // ── Observer ───────────────────────────────────────────────────────────────
   let observer = null;
@@ -94,35 +102,57 @@
     });
   }
 
-  // ── Enqueue ────────────────────────────────────────────────────────────────
+  // ── Enqueue / priority chain ───────────────────────────────────────────────
   function enqueueTweet(article) {
     if (submitted.has(article)) return;
-    if (!settings.enabled || settings.keywords.length === 0) return;
+    if (!settings.enabled) return;
 
-    const text = getTweetText(article);
-    if (!text) return;
+    const text   = getTweetText(article);
+    const author = getTweetAuthor(article); // lowercase handle, no @
 
     submitted.add(article);
 
-    // Cache hit — apply immediately without queuing
+    // 1. User whitelist — always show, bypass everything
+    if ((settings.usersWl || []).includes(author)) {
+      applyFilter(article, true);
+      return;
+    }
+
+    // 2. Keyword blacklist — always hide if any blocked word found in text
+    if ((settings.kwBlack || []).length > 0) {
+      const lower = text.toLowerCase();
+      if ((settings.kwBlack).some(kw => lower.includes(kw))) {
+        applyFilter(article, false);
+        return;
+      }
+    }
+
+    // 4. No keep-keywords set → show everything that passed above rules
+    if ((settings.kwWhite || []).length === 0) {
+      applyFilter(article, true);
+      return;
+    }
+
+    if (!text) { applyFilter(article, true); return; }
+
+    // 5. Cache hit
     if (cache.has(text)) {
       applyFilter(article, cache.get(text));
       return;
     }
 
-    // Exact mode — no API needed
+    // 5. Exact mode
     if (settings.filterMode === 'exact') {
-      const keep = exactMatch(text, settings.keywords);
+      const keep = exactMatch(text, settings.kwWhite);
       cache.set(text, keep);
       applyFilter(article, keep);
       return;
     }
 
-    // Mark as pending visually
+    // 6. AI semantic — queue it
     article.setAttribute('data-xfilter', 'pending');
     queue.push({ article, text });
 
-    // Flush immediately if batch is full, else arm the timer
     if (queue.length >= BATCH_SIZE) {
       flushQueue();
     } else if (!batchTimer) {
@@ -174,8 +204,8 @@
     let results;
     try {
       results = settings.provider === 'openai'
-        ? await classifyBatchOpenAI(unique, settings.keywords, settings.apiKey, settings.openaiModel)
-        : await classifyBatchGemini(unique, settings.keywords, settings.apiKey);
+        ? await classifyBatchOpenAI(unique, settings.kwWhite, settings.apiKey, settings.openaiModel)
+        : await classifyBatchGemini(unique, settings.kwWhite, settings.apiKey);
     } catch (err) {
       // On rate limit, classifyBatch already re-queued and set the timer — just return
       if (err.message === 'Rate limited') return;
@@ -203,11 +233,11 @@
 
   // ── Gemini batch classifier ────────────────────────────────────────────────
   const GEMINI_URL =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent';
 
   async function classifyBatchGemini(texts, keywords, apiKey) {
     const numbered = texts
-      .map((t, i) => `${i + 1}. """${t.replace(/"""/g, "'''")}"""`)
+      .map((t, i) => `${i + 1}. "${t.slice(0, 180).replace(/"/g, "'")}"`)
       .join('\n');
 
     const prompt =
@@ -228,7 +258,7 @@ No explanation. No markdown. Just the raw JSON array.`;
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0, maxOutputTokens: 800 },
+        generationConfig: { temperature: 0, maxOutputTokens: 256 },
       }),
     });
 
@@ -274,7 +304,7 @@ No explanation. No markdown. Just the raw JSON array.`;
 
   async function classifyBatchOpenAI(texts, keywords, apiKey, model = 'gpt-4o-mini') {
     const numbered = texts
-      .map((t, i) => `${i + 1}. """${t.replace(/"""/g, "'''")}"""`)
+      .map((t, i) => `${i + 1}. "${t.slice(0, 180).replace(/"/g, "'")}"`)
       .join('\n');
 
     const systemPrompt =
@@ -373,6 +403,23 @@ Reply with a JSON boolean array, one entry per tweet. Example for 3 tweets: [tru
     return el ? el.innerText.trim() : '';
   }
 
+  function getTweetAuthor(article) {
+    // The @handle lives in a link with href="/username"
+    const link = article.querySelector('a[href^="/"][role="link"] span');
+    if (link) {
+      const txt = link.innerText.trim().replace(/^@/, '');
+      if (txt && !txt.includes(' ')) return txt.toLowerCase();
+    }
+    // Fallback: find the User-Name testid
+    const nameEl = article.querySelector('[data-testid="User-Name"] a');
+    if (nameEl) {
+      const href = nameEl.getAttribute('href') || '';
+      const handle = href.replace('/', '').toLowerCase();
+      if (handle && !handle.includes('/')) return handle;
+    }
+    return '';
+  }
+
   function applyFilter(article, shouldKeep) {
     if (!article) return;
     // Set attribute on the article — CSS rule above does the hiding.
@@ -381,9 +428,9 @@ Reply with a JSON boolean array, one entry per tweet. Example for 3 tweets: [tru
     console.log(`[XFilter] ${shouldKeep ? '✅ kept' : '❌ hidden'}: "${getTweetText(article).slice(0, 60)}"`);
   }
 
-  function exactMatch(text, keywords) {
+  function exactMatch(text, kwWhite) {
     const lower = text.toLowerCase();
-    return keywords.some(kw => lower.includes(kw));
+    return kwWhite.some(kw => lower.includes(kw));
   }
 
 })();
