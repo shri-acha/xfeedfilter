@@ -1,7 +1,6 @@
-
 # xfeedfilter — Firefox Extension
 
-A Firefox extension that uses AI to filter your X feed based on custom keywords. Irrelevant tweets are hidden automatically as you scroll.
+A vibecoded Firefox extension that uses AI to filter your X feed based on custom keywords. Irrelevant tweets are hidden automatically as you scroll.
 
 ---
 
