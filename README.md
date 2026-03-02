@@ -1,3 +1,4 @@
+**Vibe-Coded**
 
 # xfeedfilter — Firefox Extension
 
