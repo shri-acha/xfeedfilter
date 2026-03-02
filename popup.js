@@ -1,7 +1,6 @@
 (() => {
   let kwWhite   = [];
   let kwBlack   = [];
-  let usersWl   = [];
   let filterMode  = 'semantic';
   let provider    = 'gemini';
   let openaiModel = 'gpt-4o-mini';
@@ -27,25 +26,20 @@
     logoSub:           $('logoSub'),
     tabKwWhite:        $('tabKwWhite'),
     tabKwBlack:        $('tabKwBlack'),
-    tabUsers:          $('tabUsers'),
     panelKwWhite:      $('panelKwWhite'),
     panelKwBlack:      $('panelKwBlack'),
-    panelUsers:        $('panelUsers'),
     kwWhiteBox:        $('kwWhiteBox'),
     kwWhiteContainer:  $('kwWhiteContainer'),
     kwWhiteInput:      $('kwWhiteInput'),
     kwBlackBox:        $('kwBlackBox'),
     kwBlackContainer:  $('kwBlackContainer'),
     kwBlackInput:      $('kwBlackInput'),
-    usersWlBox:        $('usersWlBox'),
-    usersWlContainer:  $('usersWlContainer'),
-    usersWlInput:      $('usersWlInput'),
   };
 
   // ── Load ───────────────────────────────────────────────────────────────────
   browser.storage.local.get([
     'apiKey','enabled','filterMode','provider','openaiModel',
-    'kwWhite','kwBlack','usersWl'
+    'kwWhite','kwBlack'
   ]).then(data => {
     if (data.apiKey)      el.apiKey.value = data.apiKey;
     if (data.filterMode)  { filterMode  = data.filterMode;  updateModeUI(); }
@@ -53,7 +47,6 @@
     if (data.openaiModel) { openaiModel = data.openaiModel; }
     if (data.kwWhite)     kwWhite = data.kwWhite;
     if (data.kwBlack)     kwBlack = data.kwBlack;
-    if (data.usersWl)     usersWl = data.usersWl;
 
     renderAllTags();
     updateProviderUI();
@@ -67,7 +60,6 @@
   const tabDefs = [
     { btn: el.tabKwWhite, panel: el.panelKwWhite, key: 'kwWhite', cls: 'active-white' },
     { btn: el.tabKwBlack, panel: el.panelKwBlack, key: 'kwBlack', cls: 'active-black' },
-    { btn: el.tabUsers,   panel: el.panelUsers,   key: 'users',   cls: 'active-users' },
   ];
 
   tabDefs.forEach(({ btn, key, cls }) => {
@@ -81,16 +73,14 @@
 
   el.kwWhiteBox.addEventListener('click', () => el.kwWhiteInput.focus());
   el.kwBlackBox.addEventListener('click', () => el.kwBlackInput.focus());
-  el.usersWlBox.addEventListener('click', () => el.usersWlInput.focus());
 
   // ── Tag inputs ─────────────────────────────────────────────────────────────
   setupTagInput(el.kwWhiteInput, 'kwWhite', 'kw-white');
   setupTagInput(el.kwBlackInput, 'kwBlack', 'kw-black');
-  setupTagInput(el.usersWlInput, 'usersWl', 'usr-wl', v => v.replace(/^@+/, '').toLowerCase().trim());
 
   function setupTagInput(input, listKey, tagCls, normalize) {
     input.addEventListener('keydown', e => {
-      const lists = { kwWhite, kwBlack, usersWl };
+      const lists = { kwWhite, kwBlack };
       const list  = lists[listKey];
       const raw   = input.value.replace(',', '').trim();
       if ((e.key === 'Enter' || e.key === ',') && raw) {
@@ -108,13 +98,12 @@
   function renderAllTags() {
     renderTags('kwWhite', 'kw-white');
     renderTags('kwBlack', 'kw-black');
-    renderTags('usersWl', 'usr-wl');
   }
 
   function renderTags(listKey, tagCls) {
-    const containers = { kwWhite: el.kwWhiteContainer, kwBlack: el.kwBlackContainer, usersWl: el.usersWlContainer };
-    const inputs     = { kwWhite: el.kwWhiteInput,     kwBlack: el.kwBlackInput,     usersWl: el.usersWlInput };
-    const lists      = { kwWhite, kwBlack, usersWl };
+    const containers = { kwWhite: el.kwWhiteContainer, kwBlack: el.kwBlackContainer };
+    const inputs     = { kwWhite: el.kwWhiteInput,     kwBlack: el.kwBlackInput };
+    const lists      = { kwWhite, kwBlack };
     const container  = containers[listKey];
     const input      = inputs[listKey];
     const list       = lists[listKey];
@@ -123,7 +112,7 @@
     list.forEach((val, i) => {
       const tag    = document.createElement('span');
       tag.className = `tag ${tagCls}`;
-      const prefix = listKey === 'usersWl' ? '@' : '';
+      const prefix = '';
       tag.innerHTML = `${escHtml(prefix + val)} <span class="tag-remove" data-list="${listKey}" data-idx="${i}">×</span>`;
       container.insertBefore(tag, input);
     });
@@ -151,6 +140,7 @@
     el.openaiModelRow.style.display = isOpenAI ? '' : 'none';
     el.apiKeyLabel.textContent = isOpenAI ? 'OpenAI API Key' : 'Gemini API Key';
     el.apiKey.placeholder      = isOpenAI ? 'sk-...' : 'AIza...';
+    el.logoSub.textContent     = isOpenAI ? 'Powered by OpenAI' : 'Powered by Gemini AI';
   }
 
   // ── Model ──────────────────────────────────────────────────────────────────
@@ -189,7 +179,7 @@
   function updateStatus() {
     const enabled = el.toggle.checked;
     const hasKey  = el.apiKey.value.trim().length > 0;
-    const hasAny  = kwWhite.length > 0 || kwBlack.length > 0 || usersWl.length > 0;
+    const hasAny  = kwWhite.length > 0 || kwBlack.length > 0;
 
     if (!enabled) {
       setStatus('idle', 'Filtering is paused.');
@@ -201,7 +191,6 @@
       const parts = [];
       if (kwWhite.length) parts.push(`${kwWhite.length} keep`);
       if (kwBlack.length) parts.push(`${kwBlack.length} block`);
-      if (usersWl.length) parts.push(`${usersWl.length} users`);
       setStatus('active', `Active · ${parts.join(' · ')}`);
     }
   }
@@ -221,7 +210,7 @@
       return;
     }
 
-    const settings = { apiKey, enabled, filterMode, provider, openaiModel, kwWhite, kwBlack, usersWl };
+    const settings = { apiKey, enabled, filterMode, provider, openaiModel, kwWhite, kwBlack };
     await browser.storage.local.set(settings);
 
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });

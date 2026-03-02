@@ -1,9 +1,3 @@
-/**
- * X Feed Filter — Content Script
- * Batches tweets and classifies them in a single Gemini API call
- * to stay within free-tier rate limits.
- */
-
 (function () {
   'use strict';
 
@@ -12,8 +6,7 @@
     enabled:     false,
     apiKey:      '',
     kwWhite:     [],   // keep-keywords  → fed to AI as topics
-    kwBlack:     [],   // block-keywords → always hide, no AI
-    usersWl:     [],   // user whitelist → always show
+    kwBlack:     [],   // block-keywords → checked in exact mode / passed to AI
     filterMode:  'semantic',
     provider:    'gemini',
     openaiModel: 'gpt-4o-mini',
@@ -31,7 +24,7 @@
 
   // Batch config
   const BATCH_SIZE     = 10;    // send when we have this many new tweets
-  const BATCH_DELAY    = 5000;  // or after 5s, whichever comes first
+  const BATCH_DELAY    = 10000;  // or after 5s, whichever comes first
   const RETRY_DELAY    = 62000; // 62s back-off after 429
 
   let batchTimer       = null;
@@ -39,7 +32,7 @@
   let lastCallAt        = 0;     // timestamp of last API call
 
   // ── Init ───────────────────────────────────────────────────────────────────
-  browser.storage.local.get(['apiKey', 'kwWhite', 'kwBlack', 'usersWl', 'enabled', 'filterMode', 'provider', 'openaiModel']).then(data => {
+  browser.storage.local.get(['apiKey', 'kwWhite', 'kwBlack', 'enabled', 'filterMode', 'provider', 'openaiModel']).then(data => {
     Object.assign(settings, data);
     if (settings.enabled && hasAnyList()) {
       observeFeed();
@@ -66,8 +59,7 @@
 
   function hasAnyList() {
     return (settings.kwWhite || []).length > 0 ||
-           (settings.kwBlack || []).length > 0 ||
-           (settings.usersWl || []).length > 0;
+           (settings.kwBlack || []).length > 0;
   }
 
   // ── Observer ───────────────────────────────────────────────────────────────
@@ -102,54 +94,29 @@
     });
   }
 
-  // ── Enqueue / priority chain ───────────────────────────────────────────────
+  // ── Enqueue ────────────────────────────────────────────────────────────────
   function enqueueTweet(article) {
     if (submitted.has(article)) return;
     if (!settings.enabled) return;
 
-    const text   = getTweetText(article);
-    const author = getTweetAuthor(article); // lowercase handle, no @
-
+    const text = getTweetText(article);
+    if (!text) return;
     submitted.add(article);
 
-    // 1. User whitelist — always show, bypass everything
-    if ((settings.usersWl || []).includes(author)) {
-      applyFilter(article, true);
+    // Exact mode — plain substring check, no cache
+    if (settings.filterMode === 'exact') {
+      const blocked = (settings.kwBlack || []).some(kw => text.toLowerCase().includes(kw));
+      const kept    = (settings.kwWhite || []).length === 0 || exactMatch(text, settings.kwWhite);
+      applyFilter(article, !blocked && kept);
       return;
     }
 
-    // 2. Keyword blacklist — always hide if any blocked word found in text
-    if ((settings.kwBlack || []).length > 0) {
-      const lower = text.toLowerCase();
-      if ((settings.kwBlack).some(kw => lower.includes(kw))) {
-        applyFilter(article, false);
-        return;
-      }
-    }
-
-    // 4. No keep-keywords set → show everything that passed above rules
-    if ((settings.kwWhite || []).length === 0) {
-      applyFilter(article, true);
-      return;
-    }
-
-    if (!text) { applyFilter(article, true); return; }
-
-    // 5. Cache hit
+    // Semantic — check cache first, then queue for AI
     if (cache.has(text)) {
       applyFilter(article, cache.get(text));
       return;
     }
 
-    // 5. Exact mode
-    if (settings.filterMode === 'exact') {
-      const keep = exactMatch(text, settings.kwWhite);
-      cache.set(text, keep);
-      applyFilter(article, keep);
-      return;
-    }
-
-    // 6. AI semantic — queue it
     article.setAttribute('data-xfilter', 'pending');
     queue.push({ article, text });
 
@@ -233,19 +200,22 @@
 
   // ── Gemini batch classifier ────────────────────────────────────────────────
   const GEMINI_URL =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent';
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent';
 
   async function classifyBatchGemini(texts, keywords, apiKey) {
     const numbered = texts
       .map((t, i) => `${i + 1}. "${t.slice(0, 180).replace(/"/g, "'")}"`)
       .join('\n');
 
+    const blockLine = (settings.kwBlack || []).length > 0
+      ? `\nBlock topics (always return false if tweet matches any): ${settings.kwBlack.join(', ')}` : '';
+
     const prompt =
 `You are a tweet relevance classifier.
 
-Topics/Keywords: ${keywords.join(', ')}
+Keep topics: ${keywords.join(', ')}${blockLine}
 
-Below are ${texts.length} tweets, each numbered. Decide if each tweet is relevant to ANY of the topics above (consider synonyms and semantic meaning, not just exact words).
+Below are ${texts.length} tweets, each numbered. Return true if a tweet is relevant to ANY keep topic (considering synonyms and semantic meaning). Return false if it matches a block topic or is irrelevant.
 
 ${numbered}
 
@@ -253,13 +223,18 @@ Reply with ONLY a JSON array of booleans, one per tweet, in the same order.
 Example for 3 tweets: [true, false, true]
 No explanation. No markdown. Just the raw JSON array.`;
 
+    const geminiBody = JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0, maxOutputTokens: 800 },
+    });
+
     const res = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0, maxOutputTokens: 256 },
-      }),
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': new TextEncoder().encode(geminiBody).length.toString(),
+      },
+      body: geminiBody,
     });
 
     if (!res.ok) {
@@ -307,32 +282,39 @@ No explanation. No markdown. Just the raw JSON array.`;
       .map((t, i) => `${i + 1}. "${t.slice(0, 180).replace(/"/g, "'")}"`)
       .join('\n');
 
+    const blockLine = (settings.kwBlack || []).length > 0
+      ? ` Block topics (always false): ${settings.kwBlack.join(', ')}.` : '';
+
     const systemPrompt =
-`You are a tweet relevance classifier. Given a list of topics/keywords and numbered tweets, return ONLY a JSON array of booleans indicating whether each tweet is relevant to ANY of the topics. Consider synonyms and semantic meaning. No explanation, no markdown — raw JSON array only.`;
+`You are a tweet relevance classifier. Return ONLY a JSON boolean array — no explanation, no markdown.${blockLine}`;
 
     const userPrompt =
-`Topics/Keywords: ${keywords.join(', ')}
+`Keep topics: ${keywords.join(', ')}
 
 Tweets:
 ${numbered}
 
-Reply with a JSON boolean array, one entry per tweet. Example for 3 tweets: [true, false, true]`;
+Return true if relevant to any keep topic (semantically). Return false if it matches a block topic or is irrelevant.
+Reply with a JSON boolean array. Example: [true, false, true]`;
+
+    const openaiBody = JSON.stringify({
+      model,
+      temperature: 0,
+      max_tokens: 200,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userPrompt   },
+      ],
+    });
 
     const res = await fetch(OPENAI_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
+        'Content-Length': new TextEncoder().encode(openaiBody).length.toString(),
       },
-      body: JSON.stringify({
-        model,
-        temperature: 0,
-        max_tokens: 200,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user',   content: userPrompt   },
-        ],
-      }),
+      body: openaiBody,
     });
 
     if (!res.ok) {
@@ -401,23 +383,6 @@ Reply with a JSON boolean array, one entry per tweet. Example for 3 tweets: [tru
   function getTweetText(article) {
     const el = article.querySelector('[data-testid="tweetText"]');
     return el ? el.innerText.trim() : '';
-  }
-
-  function getTweetAuthor(article) {
-    // The @handle lives in a link with href="/username"
-    const link = article.querySelector('a[href^="/"][role="link"] span');
-    if (link) {
-      const txt = link.innerText.trim().replace(/^@/, '');
-      if (txt && !txt.includes(' ')) return txt.toLowerCase();
-    }
-    // Fallback: find the User-Name testid
-    const nameEl = article.querySelector('[data-testid="User-Name"] a');
-    if (nameEl) {
-      const href = nameEl.getAttribute('href') || '';
-      const handle = href.replace('/', '').toLowerCase();
-      if (handle && !handle.includes('/')) return handle;
-    }
-    return '';
   }
 
   function applyFilter(article, shouldKeep) {
